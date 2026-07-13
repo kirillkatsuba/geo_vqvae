@@ -2,8 +2,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib-geo-vqvae")
+
+import matplotlib
+
+matplotlib.use("Agg")
+
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
@@ -34,7 +42,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--domain", choices=["center_val", "north_known", "both"], default="both")
     parser.add_argument("--sequence-length", type=int, default=0)
     parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--max-plot-points", type=int, default=60000)
     parser.add_argument("--device", choices=["auto", "cpu", "mps", "cuda"], default="auto")
+    parser.add_argument("--no-plots", action="store_true")
     parser.add_argument("--no-progress", action="store_true")
     return parser.parse_args()
 
@@ -98,6 +108,71 @@ def compute_metrics(df: pd.DataFrame, targets: list[str]) -> pd.DataFrame:
             }
         )
     return pd.DataFrame(rows)
+
+
+def plot_xy_maps(
+    df: pd.DataFrame,
+    metrics: pd.DataFrame,
+    targets: list[str],
+    output_dir: Path,
+    max_points: int,
+    seed: int = 42,
+) -> None:
+    plot_dir = output_dir / "plots"
+    plot_dir.mkdir(parents=True, exist_ok=True)
+    rng = np.random.default_rng(seed)
+    if len(df) > max_points:
+        plot_df = df.iloc[rng.choice(len(df), size=max_points, replace=False)].copy()
+    else:
+        plot_df = df.copy()
+
+    for target in targets:
+        fig, axes = plt.subplots(1, 3, figsize=(18, 5), constrained_layout=True)
+        columns = [f"true_{target}", f"pred_{target}", f"error_{target}"]
+        titles = [f"{target} true", f"{target} pred", f"{target} error"]
+        for ax, col, title in zip(axes, columns, titles):
+            values = plot_df[col].to_numpy(dtype=float)
+            finite = np.isfinite(values)
+            if not np.any(finite):
+                ax.set_title(title)
+                continue
+            if col.startswith("error_"):
+                vmax = float(np.nanpercentile(np.abs(values), 98))
+                if not np.isfinite(vmax) or vmax <= 0:
+                    vmax = 1.0
+                vmin = -vmax
+                cmap = "coolwarm"
+            else:
+                vmin = float(np.nanpercentile(values, 2))
+                vmax = float(np.nanpercentile(values, 98))
+                if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin == vmax:
+                    vmin = float(np.nanmin(values))
+                    vmax = float(np.nanmax(values))
+                cmap = "viridis"
+            sc = ax.scatter(
+                plot_df["X"],
+                plot_df["Y"],
+                c=values,
+                s=2,
+                cmap=cmap,
+                vmin=vmin,
+                vmax=vmax,
+                linewidths=0,
+            )
+            ax.set_title(title)
+            ax.set_aspect("equal", adjustable="box")
+            ax.set_xlabel("X")
+            ax.set_ylabel("Y")
+            fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
+        metric_row = metrics.loc[metrics["target"] == target]
+        if not metric_row.empty:
+            row = metric_row.iloc[0]
+            fig.suptitle(
+                f"{target}: MAE={row['MAE']:.4g}, RMSE={row['RMSE']:.4g}, R2={row['R2']:.4g}",
+                fontsize=12,
+            )
+        fig.savefig(plot_dir / f"xy_{target}.png", dpi=180)
+        plt.close(fig)
 
 
 @torch.no_grad()
@@ -215,6 +290,8 @@ def main() -> None:
         pred.to_csv(domain_dir / "predictions.csv", index=False)
         metrics = compute_metrics(pred, target_scaler.columns)
         metrics.to_csv(domain_dir / "metrics.csv", index=False)
+        if not args.no_plots:
+            plot_xy_maps(pred, metrics, target_scaler.columns, domain_dir, args.max_plot_points)
         print(metrics.to_string(index=False))
         print(f"Saved: {domain_dir}")
 
