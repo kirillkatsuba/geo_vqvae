@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+.DS_Store
+
+prepared*/
+runs/
+eval/
+*.pt
+*.pth
+
+*.parquet
+*.csv
+*.xlsx
+*.xls
+
+.ipynb_checkpoints/
