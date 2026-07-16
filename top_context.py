@@ -67,11 +67,13 @@ def attach_top_context(
     weights = 1.0 / np.maximum(distances, 1e-6)
     weights = weights / weights.sum(axis=1, keepdims=True)
     context = np.einsum("nk,nkd->nd", weights, assay_embeddings[indices])
-    out = blocks.copy()
     columns = [f"{prefix}_{idx}" for idx in range(context.shape[1])]
-    for idx, col in enumerate(columns):
-        out[col] = context[:, idx].astype(np.float32)
-    out[f"{prefix}_nearest_distance"] = distances[:, 0].astype(np.float32)
+    context_df = pd.DataFrame(context.astype(np.float32), columns=columns, index=blocks.index)
+    distance_df = pd.DataFrame(
+        {f"{prefix}_nearest_distance": distances[:, 0].astype(np.float32)},
+        index=blocks.index,
+    )
+    out = pd.concat([blocks.copy(), context_df, distance_df], axis=1)
     return out, columns
 
 
@@ -107,14 +109,13 @@ def attach_prior_top_context(
 ) -> tuple[pd.DataFrame, list[str]]:
     from .dataset import chunk_indices, order_by_xyz
 
-    out = blocks.copy()
-    order = order_by_xyz(out)
+    order = order_by_xyz(blocks)
     sequences = chunk_indices(order, sequence_length)
-    context = np.full((len(out), top_model.d_model), np.nan, dtype=np.float32)
-    code_values = np.full(len(out), -1, dtype=np.int64)
+    context = np.full((len(blocks), top_model.d_model), np.nan, dtype=np.float32)
+    code_values = np.full(len(blocks), -1, dtype=np.int64)
     for seq in sequences:
         block = torch.tensor(
-            out.iloc[seq][block_feature_columns].to_numpy(dtype=np.float32),
+            blocks.iloc[seq][block_feature_columns].to_numpy(dtype=np.float32),
             device=device,
         ).unsqueeze(0)
         mask = torch.ones(1, len(seq), dtype=torch.bool, device=device)
@@ -123,7 +124,7 @@ def attach_prior_top_context(
         context[seq] = z.detach().cpu().numpy()
         code_values[seq] = codes.detach().cpu().numpy()
     columns = [f"{prefix}_{idx}" for idx in range(context.shape[1])]
-    for idx, col in enumerate(columns):
-        out[col] = context[:, idx]
-    out[f"{prefix}_prior_code"] = code_values
+    context_df = pd.DataFrame(context, columns=columns, index=blocks.index)
+    code_df = pd.DataFrame({f"{prefix}_prior_code": code_values}, index=blocks.index)
+    out = pd.concat([blocks.copy(), context_df, code_df], axis=1)
     return out, columns
