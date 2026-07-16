@@ -43,6 +43,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sequence-length", type=int, default=0)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--max-plot-points", type=int, default=60000)
+    parser.add_argument("--decode-mode", choices=["hard", "soft"], default="hard")
+    parser.add_argument("--softmax-temperature", type=float, default=1.0)
     parser.add_argument("--device", choices=["auto", "cpu", "mps", "cuda"], default="auto")
     parser.add_argument("--no-plots", action="store_true")
     parser.add_argument("--no-progress", action="store_true")
@@ -186,6 +188,8 @@ def predict_domain(
     batch_size: int,
     device: torch.device,
     show_progress: bool,
+    decode_mode: str = "hard",
+    softmax_temperature: float = 1.0,
 ) -> pd.DataFrame:
     block_columns = ckpt["block_feature_columns"]
     target_columns = ckpt["target_columns"]
@@ -201,7 +205,13 @@ def predict_domain(
         block = batch["block_features"].to(device)
         top = batch["top_context"].to(device)
         mask = batch["mask"].to(device)
-        pred, _ = model.generate(block, top, mask=mask)
+        pred, _ = model.generate(
+            block,
+            top,
+            mask=mask,
+            decode_mode=decode_mode,
+            temperature=softmax_temperature,
+        )
         pred_np = pred.detach().cpu().numpy()
         order_np = batch["order"].numpy()
         mask_np = batch["mask"].numpy()
@@ -284,6 +294,8 @@ def main() -> None:
             args.batch_size,
             device,
             not args.no_progress,
+            args.decode_mode,
+            args.softmax_temperature,
         )
         domain_dir = args.output_dir / name
         domain_dir.mkdir(parents=True, exist_ok=True)

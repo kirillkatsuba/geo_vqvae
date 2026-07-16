@@ -181,10 +181,19 @@ class LowVQVAE2(nn.Module):
         block_features: torch.Tensor,
         top_context: torch.Tensor,
         mask: torch.Tensor | None = None,
+        decode_mode: str = "hard",
+        temperature: float = 1.0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         logits = self.prior_logits(block_features, top_context, mask=mask)
         codes = logits.argmax(dim=-1)
-        z_q = self.quantizer.embedding(codes)
+        if decode_mode == "soft":
+            temp = max(float(temperature), 1e-6)
+            probs = F.softmax(logits / temp, dim=-1)
+            z_q = probs @ self.quantizer.embedding.weight
+        elif decode_mode == "hard":
+            z_q = self.quantizer.embedding(codes)
+        else:
+            raise ValueError(f"Unknown decode_mode: {decode_mode}")
         pred = self.decode(block_features, top_context, z_q)
         return pred, codes
 

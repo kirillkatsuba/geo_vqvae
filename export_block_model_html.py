@@ -31,6 +31,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--max-points-per-layer", type=int, default=200000)
     parser.add_argument("--targets", type=str, default=",".join(TARGET_COLUMNS))
+    parser.add_argument("--decode-mode", choices=["hard", "soft"], default="hard")
+    parser.add_argument("--softmax-temperature", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", choices=["auto", "cpu", "mps", "cuda"], default="auto")
     parser.add_argument("--no-progress", action="store_true")
@@ -401,6 +403,8 @@ def main() -> None:
         args.batch_size,
         device,
         not args.no_progress,
+        args.decode_mode,
+        args.softmax_temperature,
     )
 
     layers = [
@@ -446,6 +450,8 @@ def main() -> None:
     payload = {
         "checkpoint": str(args.low_checkpoint),
         "prepared_dir": str(args.prepared_dir),
+        "decode_mode": args.decode_mode,
+        "softmax_temperature": args.softmax_temperature,
         "targets": targets,
         "domains": compute_domains(layers, targets),
         "layers": layers,

@@ -79,6 +79,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--corr-block-weight", type=float, default=1.0)
     parser.add_argument("--corr-assay-weight", type=float, default=1.0)
+    parser.add_argument("--decode-mode", choices=["hard", "soft"], default="hard")
+    parser.add_argument("--softmax-temperature", type=float, default=1.0)
     parser.add_argument("--max-sequences", type=int, default=0)
     parser.add_argument("--device", choices=["auto", "cpu", "mps", "cuda"], default="auto")
     parser.add_argument("--no-progress", action="store_true")
@@ -177,6 +179,8 @@ def evaluate(
     corr_references: dict[str, torch.Tensor],
     corr_block_weight: float,
     corr_assay_weight: float,
+    decode_mode: str,
+    softmax_temperature: float,
 ) -> dict[str, float]:
     model.eval()
     losses = []
@@ -188,7 +192,13 @@ def evaluate(
             top = batch["top_context"].to(device)
             targets = batch["targets"].to(device)
             mask = batch["mask"].to(device)
-            pred, _ = model.generate(block, top, mask=mask)
+            pred, _ = model.generate(
+                block,
+                top,
+                mask=mask,
+                decode_mode=decode_mode,
+                temperature=softmax_temperature,
+            )
             recon = masked_mse(pred, targets, mask)
             corr = correlation_regularization(
                 pred,
@@ -330,6 +340,8 @@ def main() -> None:
             corr_references,
             args.corr_block_weight,
             args.corr_assay_weight,
+            args.decode_mode,
+            args.softmax_temperature,
         )
         row = {
             "epoch": epoch,
@@ -357,6 +369,8 @@ def main() -> None:
                         "corr_reference_split": args.corr_reference_split,
                         "corr_block_weight": args.corr_block_weight,
                         "corr_assay_weight": args.corr_assay_weight,
+                        "decode_mode": args.decode_mode,
+                        "softmax_temperature": args.softmax_temperature,
                     },
                     "block_feature_columns": block_columns,
                     "target_columns": target_columns,
