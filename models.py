@@ -205,22 +205,41 @@ def code_ce_loss(logits: torch.Tensor, codes: torch.Tensor, mask: torch.Tensor |
     return loss.sum() / mask.sum().clamp_min(1).to(loss.dtype)
 
 
-def correlation_loss(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+def _flatten_valid(values: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
     if mask is not None:
-        pred = pred[mask]
-        target = target[mask]
-    else:
-        pred = pred.reshape(-1, pred.size(-1))
-        target = target.reshape(-1, target.size(-1))
+        return values[mask]
+    return values.reshape(-1, values.size(-1))
+
+
+def correlation_matrix(values: torch.Tensor) -> torch.Tensor:
+    if values.size(0) < values.size(1) + 2:
+        return torch.eye(values.size(1), device=values.device, dtype=values.dtype)
+    values = values - values.mean(dim=0, keepdim=True)
+    values = values / values.std(dim=0, keepdim=True).clamp_min(1e-6)
+    return values.t() @ values / max(1, values.size(0) - 1)
+
+
+def correlation_loss(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+    pred = _flatten_valid(pred, mask)
+    target = _flatten_valid(target, mask)
     if pred.size(0) < pred.size(1) + 2:
         return pred.new_tensor(0.0)
-    pred = pred - pred.mean(dim=0, keepdim=True)
-    target = target - target.mean(dim=0, keepdim=True)
-    pred = pred / pred.std(dim=0, keepdim=True).clamp_min(1e-6)
-    target = target / target.std(dim=0, keepdim=True).clamp_min(1e-6)
-    pred_corr = pred.t() @ pred / max(1, pred.size(0) - 1)
-    target_corr = target.t() @ target / max(1, target.size(0) - 1)
+    pred_corr = correlation_matrix(pred)
+    target_corr = correlation_matrix(target)
     return F.mse_loss(pred_corr, target_corr)
+
+
+def reference_correlation_loss(
+    pred: torch.Tensor,
+    reference_corr: torch.Tensor,
+    mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    pred = _flatten_valid(pred, mask)
+    if pred.size(0) < pred.size(1) + 2:
+        return pred.new_tensor(0.0)
+    pred_corr = correlation_matrix(pred)
+    reference_corr = reference_corr.to(device=pred.device, dtype=pred.dtype)
+    return F.mse_loss(pred_corr, reference_corr)
 
 
 class TopPriorTransformer(nn.Module):

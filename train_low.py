@@ -11,7 +11,8 @@ import torch
 from torch.utils.data import DataLoader
 
 from .dataset import LowSequenceDataset, chunk_indices, collate_padded, order_by_xyz
-from .models import LowVQVAE2, code_ce_loss, correlation_loss, masked_mse
+from .models import LowVQVAE2, code_ce_loss, correlation_loss, masked_mse, reference_correlation_loss
+from .preprocessing import TargetScaler
 from .top_context import (
     attach_prior_top_context,
     attach_top_context,
@@ -61,6 +62,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lambda-vq", type=float, default=1.0)
     parser.add_argument("--lambda-code", type=float, default=0.2)
     parser.add_argument("--lambda-corr", type=float, default=0.1)
+    parser.add_argument(
+        "--corr-mode",
+        choices=["none", "batch", "global", "batch_global"],
+        default="batch",
+        help=(
+            "Correlation regularization mode. batch matches each prediction batch to its targets; "
+            "global matches predictions to reference correlations from source block model and assays."
+        ),
+    )
+    parser.add_argument(
+        "--corr-reference-split",
+        choices=["train", "train_val"],
+        default="train",
+        help="Block-model split used to build the global block correlation reference.",
+    )
+    parser.add_argument("--corr-block-weight", type=float, default=1.0)
+    parser.add_argument("--corr-assay-weight", type=float, default=1.0)
     parser.add_argument("--max-sequences", type=int, default=0)
     parser.add_argument("--device", choices=["auto", "cpu", "mps", "cuda"], default="auto")
     parser.add_argument("--no-progress", action="store_true")
@@ -81,7 +99,85 @@ def choose_device(name: str) -> torch.device:
     return torch.device("cpu")
 
 
-def evaluate(model: LowVQVAE2, loader: DataLoader, device: torch.device, lambda_corr: float) -> dict[str, float]:
+def numpy_correlation_matrix(values: pd.DataFrame) -> np.ndarray:
+    arr = values.dropna().to_numpy(dtype=np.float32)
+    dim = values.shape[1]
+    if arr.shape[0] < dim + 2:
+        return np.eye(dim, dtype=np.float32)
+    arr = arr - arr.mean(axis=0, keepdims=True)
+    arr = arr / np.maximum(arr.std(axis=0, keepdims=True), 1e-6)
+    return (arr.T @ arr / max(1, arr.shape[0] - 1)).astype(np.float32)
+
+
+def build_correlation_references(
+    prepared_dir: Path,
+    center: pd.DataFrame,
+    assays: pd.DataFrame,
+    metadata: dict,
+    split: str,
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
+    target_columns = list(metadata["target_columns"])
+    scaled_target_columns = list(metadata["scaled_target_columns"])
+    block_splits = ["train"] if split == "train" else ["train", "val"]
+    block_ref = center.loc[center["split"].isin(block_splits), scaled_target_columns]
+    refs = {
+        "block": torch.tensor(numpy_correlation_matrix(block_ref), device=device),
+    }
+
+    available_targets = [col for col in target_columns if col in assays.columns]
+    if len(available_targets) == len(target_columns):
+        assay_ref = assays.loc[assays["has_targets"], target_columns].dropna()
+        if not assay_ref.empty:
+            scaler = TargetScaler.load(prepared_dir / "target_scaler.json")
+            assay_ref_scaled = scaler.transform(assay_ref)
+            refs["assay"] = torch.tensor(numpy_correlation_matrix(assay_ref_scaled), device=device)
+    return refs
+
+
+def correlation_regularization(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+    mode: str,
+    references: dict[str, torch.Tensor],
+    block_weight: float,
+    assay_weight: float,
+) -> torch.Tensor:
+    if mode == "none":
+        return pred.new_tensor(0.0)
+
+    losses = []
+    if mode in {"batch", "batch_global"}:
+        losses.append(correlation_loss(pred, target, mask))
+
+    if mode in {"global", "batch_global"}:
+        weighted = []
+        weights = []
+        if block_weight > 0 and "block" in references:
+            weighted.append(block_weight * reference_correlation_loss(pred, references["block"], mask))
+            weights.append(block_weight)
+        if assay_weight > 0 and "assay" in references:
+            weighted.append(assay_weight * reference_correlation_loss(pred, references["assay"], mask))
+            weights.append(assay_weight)
+        if weighted:
+            losses.append(sum(weighted) / max(sum(weights), 1e-6))
+
+    if not losses:
+        return pred.new_tensor(0.0)
+    return sum(losses) / len(losses)
+
+
+def evaluate(
+    model: LowVQVAE2,
+    loader: DataLoader,
+    device: torch.device,
+    lambda_corr: float,
+    corr_mode: str,
+    corr_references: dict[str, torch.Tensor],
+    corr_block_weight: float,
+    corr_assay_weight: float,
+) -> dict[str, float]:
     model.eval()
     losses = []
     recons = []
@@ -94,7 +190,15 @@ def evaluate(model: LowVQVAE2, loader: DataLoader, device: torch.device, lambda_
             mask = batch["mask"].to(device)
             pred, _ = model.generate(block, top, mask=mask)
             recon = masked_mse(pred, targets, mask)
-            corr = correlation_loss(pred, targets, mask)
+            corr = correlation_regularization(
+                pred,
+                targets,
+                mask,
+                corr_mode,
+                corr_references,
+                corr_block_weight,
+                corr_assay_weight,
+            )
             loss = recon + lambda_corr * corr
             losses.append(float(loss.detach().cpu()))
             recons.append(float(recon.detach().cpu()))
@@ -130,6 +234,15 @@ def main() -> None:
     else:
         _, assay_embeddings = encode_assay_embeddings(assays, top_feature_columns, top_model, device)
         center_ctx, top_columns = attach_top_context(center_train_val, assays, assay_embeddings, k=args.top_k)
+
+    corr_references = build_correlation_references(
+        prepared_dir=args.prepared_dir,
+        center=center,
+        assays=assays,
+        metadata=metadata,
+        split=args.corr_reference_split,
+        device=device,
+    )
 
     train_df = center_ctx.loc[center_ctx["split"] == "train"].reset_index(drop=True)
     val_df = center_ctx.loc[center_ctx["split"] == "val"].reset_index(drop=True)
@@ -191,7 +304,15 @@ def main() -> None:
             out = model(block, top, targets, mask=mask)
             recon = masked_mse(out["recon"], targets, mask)
             ce = code_ce_loss(out["logits"], out["codes"].detach(), mask)
-            corr = correlation_loss(out["recon"], targets, mask)
+            corr = correlation_regularization(
+                out["recon"],
+                targets,
+                mask,
+                args.corr_mode,
+                corr_references,
+                args.corr_block_weight,
+                args.corr_assay_weight,
+            )
             loss = recon + args.lambda_vq * out["vq_loss"] + args.lambda_code * ce + args.lambda_corr * corr
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -200,7 +321,16 @@ def main() -> None:
             train_recon.append(float(recon.detach().cpu()))
             train_corr.append(float(corr.detach().cpu()))
 
-        val = evaluate(model, val_loader, device, args.lambda_corr)
+        val = evaluate(
+            model,
+            val_loader,
+            device,
+            args.lambda_corr,
+            args.corr_mode,
+            corr_references,
+            args.corr_block_weight,
+            args.corr_assay_weight,
+        )
         row = {
             "epoch": epoch,
             "train_loss": float(np.mean(train_losses)),
@@ -223,6 +353,10 @@ def main() -> None:
                         "target_dim": len(target_columns),
                         "top_dim": len(top_columns),
                         **asdict(config),
+                        "corr_mode": args.corr_mode,
+                        "corr_reference_split": args.corr_reference_split,
+                        "corr_block_weight": args.corr_block_weight,
+                        "corr_assay_weight": args.corr_assay_weight,
                     },
                     "block_feature_columns": block_columns,
                     "target_columns": target_columns,

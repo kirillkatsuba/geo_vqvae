@@ -121,6 +121,40 @@ target reconstruction loss
 + correlation matrix regularization
 ```
 
+Correlation regularization modes:
+
+- `--corr-mode batch`: previous behavior, match the correlation matrix of each
+  predicted batch to the ground-truth targets from the same batch.
+- `--corr-mode global`: match the correlation matrix of predictions to global
+  reference correlations from the source block model and assays.
+- `--corr-mode batch_global`: use both constraints.
+
+For the global geological constraint:
+
+```bash
+python3 -m geo_vqvae.train_low \
+  --prepared-dir geo_vqvae/prepared \
+  --top-checkpoint geo_vqvae/runs/top_v1/best_top.pt \
+  --top-prior-checkpoint geo_vqvae/runs/top_prior_v1/best_top_prior.pt \
+  --output-dir geo_vqvae/runs/low_v1_prior_global_corr \
+  --epochs 60 \
+  --batch-size 8 \
+  --sequence-length 512 \
+  --d-model 256 \
+  --n-heads 8 \
+  --n-layers 6 \
+  --codebook-size 128 \
+  --lambda-vq 0.05 \
+  --lambda-code 0.03 \
+  --lambda-corr 0.10 \
+  --corr-mode global \
+  --corr-reference-split train \
+  --corr-block-weight 1.0 \
+  --corr-assay-weight 1.0 \
+  --learning-rate 3e-5 \
+  --device cuda
+```
+
 Output:
 
 ```text
