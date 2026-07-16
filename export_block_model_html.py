@@ -166,7 +166,7 @@ def render_html(payload: dict) -> str:
     select, button {{ font-size: 14px; padding: 5px 8px; }}
     label {{ font-size: 14px; }}
     main {{ display: grid; grid-template-columns: 1fr 280px; gap: 0; min-height: calc(100vh - 120px); }}
-    #canvasWrap {{ position: relative; background: white; }}
+    #canvasWrap {{ position: relative; background: white; min-height: calc(100vh - 120px); }}
     canvas {{ width: 100%; height: 100%; display: block; }}
     aside {{ border-left: 1px solid #d8dee8; background: white; padding: 14px; overflow: auto; }}
     .layer {{ margin-bottom: 12px; padding-bottom: 12px; border-bottom: 1px solid #edf0f4; }}
@@ -252,14 +252,36 @@ def render_html(payload: dict) -> str:
         .map(cb => cb.dataset.layer);
     }}
 
-    function initView() {{
-      const xs = [], ys = [];
-      for (const layer of DATA.layers) {{
-        xs.push(...layer.x.filter(v => v !== null));
-        ys.push(...layer.y.filter(v => v !== null));
+    function finiteMinMax(values) {{
+      let min = Infinity;
+      let max = -Infinity;
+      let count = 0;
+      for (const value of values) {{
+        if (value === null || !Number.isFinite(value)) continue;
+        if (value < min) min = value;
+        if (value > max) max = value;
+        count += 1;
       }}
-      const minX = Math.min(...xs), maxX = Math.max(...xs);
-      const minY = Math.min(...ys), maxY = Math.max(...ys);
+      return {{ min, max, count }};
+    }}
+
+    function initView() {{
+      let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+      for (const layer of DATA.layers) {{
+        const xStats = finiteMinMax(layer.x);
+        const yStats = finiteMinMax(layer.y);
+        if (xStats.count) {{
+          minX = Math.min(minX, xStats.min);
+          maxX = Math.max(maxX, xStats.max);
+        }}
+        if (yStats.count) {{
+          minY = Math.min(minY, yStats.min);
+          maxY = Math.max(maxY, yStats.max);
+        }}
+      }}
+      if (!Number.isFinite(minX) || !Number.isFinite(maxX) || !Number.isFinite(minY) || !Number.isFinite(maxY)) {{
+        minX = 0; maxX = 1; minY = 0; maxY = 1;
+      }}
       const padX = (maxX - minX) * 0.04 || 1;
       const padY = (maxY - minY) * 0.04 || 1;
       view = {{ minX: minX - padX, maxX: maxX + padX, minY: minY - padY, maxY: maxY + padY }};
@@ -286,12 +308,20 @@ def render_html(payload: dict) -> str:
     }}
 
     function layerStats(layer, target) {{
-      const vals = layer.values[target].filter(v => v !== null && Number.isFinite(v));
-      if (!vals.length) return 'no finite values';
-      const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
-      const min = Math.min(...vals);
-      const max = Math.max(...vals);
-      return `n=${{vals.length}}, mean=${{mean.toFixed(4)}}, min=${{min.toFixed(4)}}, max=${{max.toFixed(4)}}`;
+      let count = 0;
+      let sum = 0;
+      let min = Infinity;
+      let max = -Infinity;
+      for (const value of layer.values[target]) {{
+        if (value === null || !Number.isFinite(value)) continue;
+        count += 1;
+        sum += value;
+        if (value < min) min = value;
+        if (value > max) max = value;
+      }}
+      if (!count) return 'no finite values';
+      const mean = sum / count;
+      return `n=${{count}}, mean=${{mean.toFixed(4)}}, min=${{min.toFixed(4)}}, max=${{max.toFixed(4)}}`;
     }}
 
     function drawLegend(target) {{
