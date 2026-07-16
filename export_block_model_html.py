@@ -12,7 +12,9 @@ from .columns import TARGET_COLUMNS
 from .evaluate import choose_device, load_low_model, predict_domain
 from .preprocessing import TargetScaler
 from .top_context import (
+    attach_nearest_top_code,
     attach_prior_top_context,
+    attach_prior_top_context_warm_start,
     attach_top_context,
     encode_assay_embeddings,
     load_top_model,
@@ -33,6 +35,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--targets", type=str, default=",".join(TARGET_COLUMNS))
     parser.add_argument("--decode-mode", choices=["hard", "soft"], default="hard")
     parser.add_argument("--softmax-temperature", type=float, default=1.0)
+    parser.add_argument("--warm-start-blocks", type=int, default=128)
+    parser.add_argument(
+        "--no-warm-start-center",
+        action="store_true",
+        help="Generate north independently instead of conditioning first north blocks on known center/south BM context.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", choices=["auto", "cpu", "mps", "cuda"], default="auto")
     parser.add_argument("--no-progress", action="store_true")
@@ -123,12 +131,31 @@ def attach_context(
     ckpt: dict,
     prepared_dir: Path,
     device: torch.device,
+    warm_start_center: bool,
+    warm_start_blocks: int,
 ) -> pd.DataFrame:
     assays = pd.read_parquet(prepared_dir / "assays.parquet")
     top_model, top_features = load_top_model(Path(ckpt["top_checkpoint"]), device)
     top_prior_path = ckpt.get("top_prior_checkpoint", "")
     if top_prior_path:
         top_prior, top_prior_ckpt = load_top_prior(Path(top_prior_path), device)
+        if warm_start_center:
+            center = pd.read_parquet(prepared_dir / "center_blocks.parquet")
+            center = center.loc[center["has_targets"]].reset_index(drop=True)
+            assay_codes, _ = encode_assay_embeddings(assays, top_features, top_model, device)
+            center = attach_nearest_top_code(center, assays, assay_codes)
+            out, _ = attach_prior_top_context_warm_start(
+                blocks.reset_index(drop=True),
+                context_blocks=center,
+                context_codes=center["top_code_label"].to_numpy(),
+                prior=top_prior,
+                top_model=top_model,
+                block_feature_columns=ckpt["block_feature_columns"],
+                sequence_length=int(top_prior_ckpt["model_config"]["sequence_length"]),
+                warm_start_length=warm_start_blocks,
+                device=device,
+            )
+            return out
         out, _ = attach_prior_top_context(
             blocks.reset_index(drop=True),
             prior=top_prior,
@@ -419,7 +446,14 @@ def main() -> None:
     center = pd.read_parquet(args.prepared_dir / "center_blocks.parquet")
     center = center.loc[center["has_targets"]].reset_index(drop=True)
     north_raw = pd.read_parquet(args.prepared_dir / "north_blocks.parquet").reset_index(drop=True)
-    north_ctx = attach_context(north_raw, ckpt, args.prepared_dir, device)
+    north_ctx = attach_context(
+        north_raw,
+        ckpt,
+        args.prepared_dir,
+        device,
+        warm_start_center=not args.no_warm_start_center,
+        warm_start_blocks=args.warm_start_blocks,
+    )
 
     sequence_length = args.sequence_length or int(ckpt["model_config"]["sequence_length"])
     print(f"Generating north predictions: rows={len(north_ctx)}, sequence_length={sequence_length}")
@@ -482,6 +516,8 @@ def main() -> None:
         "prepared_dir": str(args.prepared_dir),
         "decode_mode": args.decode_mode,
         "softmax_temperature": args.softmax_temperature,
+        "warm_start_center": not args.no_warm_start_center,
+        "warm_start_blocks": args.warm_start_blocks,
         "targets": targets,
         "domains": compute_domains(layers, targets),
         "layers": layers,

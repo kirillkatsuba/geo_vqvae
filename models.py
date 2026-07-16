@@ -319,6 +319,38 @@ class TopPriorTransformer(nn.Module):
                 prev[:, pos + 1] = code
         return codes
 
+    @torch.no_grad()
+    def generate_with_prefix(
+        self,
+        block_features: torch.Tensor,
+        prefix_codes: torch.Tensor,
+        mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        bsz, seq_len, _ = block_features.shape
+        prefix_len = int(prefix_codes.size(1))
+        if prefix_len >= seq_len:
+            return prefix_codes[:, :seq_len]
+
+        prev = torch.full((bsz, seq_len), self.bos_code, dtype=torch.long, device=block_features.device)
+        codes = torch.zeros((bsz, seq_len), dtype=torch.long, device=block_features.device)
+        if prefix_len > 0:
+            codes[:, :prefix_len] = prefix_codes
+            if prefix_len > 1:
+                prev[:, 1:prefix_len] = prefix_codes[:, :-1]
+            prev[:, prefix_len] = prefix_codes[:, -1]
+
+        for pos in range(prefix_len, seq_len):
+            logits = self.forward(
+                block_features[:, : pos + 1],
+                prev[:, : pos + 1],
+                None if mask is None else mask[:, : pos + 1],
+            )
+            code = logits[:, -1].argmax(dim=-1)
+            codes[:, pos] = code
+            if pos + 1 < seq_len:
+                prev[:, pos + 1] = code
+        return codes
+
 
 def shift_codes_right(codes: torch.Tensor, bos_code: int) -> torch.Tensor:
     prev = torch.full_like(codes, bos_code)

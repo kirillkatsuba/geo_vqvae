@@ -21,7 +21,9 @@ from .dataset import LowSequenceDataset, chunk_indices, collate_padded, order_by
 from .models import LowVQVAE2
 from .preprocessing import TargetScaler
 from .top_context import (
+    attach_nearest_top_code,
     attach_prior_top_context,
+    attach_prior_top_context_warm_start,
     attach_top_context,
     encode_assay_embeddings,
     load_top_model,
@@ -45,6 +47,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-plot-points", type=int, default=60000)
     parser.add_argument("--decode-mode", choices=["hard", "soft"], default="hard")
     parser.add_argument("--softmax-temperature", type=float, default=1.0)
+    parser.add_argument("--warm-start-center", action="store_true")
+    parser.add_argument("--warm-start-blocks", type=int, default=128)
     parser.add_argument("--device", choices=["auto", "cpu", "mps", "cuda"], default="auto")
     parser.add_argument("--no-plots", action="store_true")
     parser.add_argument("--no-progress", action="store_true")
@@ -269,14 +273,31 @@ def main() -> None:
         north = pd.read_parquet(args.prepared_dir / "north_blocks.parquet")
         north = north.loc[north["split"] == "test_north_known"].reset_index(drop=True)
         if top_prior is not None and top_prior_ckpt is not None:
-            north, _ = attach_prior_top_context(
-                north,
-                prior=top_prior,
-                top_model=top_model,
-                block_feature_columns=ckpt["block_feature_columns"],
-                sequence_length=int(top_prior_ckpt["model_config"]["sequence_length"]),
-                device=device,
-            )
+            if args.warm_start_center:
+                center_context = pd.read_parquet(args.prepared_dir / "center_blocks.parquet")
+                center_context = center_context.loc[center_context["has_targets"]].reset_index(drop=True)
+                assay_codes, _ = encode_assay_embeddings(assays, top_features, top_model, device)
+                center_context = attach_nearest_top_code(center_context, assays, assay_codes)
+                north, _ = attach_prior_top_context_warm_start(
+                    north,
+                    context_blocks=center_context,
+                    context_codes=center_context["top_code_label"].to_numpy(),
+                    prior=top_prior,
+                    top_model=top_model,
+                    block_feature_columns=ckpt["block_feature_columns"],
+                    sequence_length=int(top_prior_ckpt["model_config"]["sequence_length"]),
+                    warm_start_length=args.warm_start_blocks,
+                    device=device,
+                )
+            else:
+                north, _ = attach_prior_top_context(
+                    north,
+                    prior=top_prior,
+                    top_model=top_model,
+                    block_feature_columns=ckpt["block_feature_columns"],
+                    sequence_length=int(top_prior_ckpt["model_config"]["sequence_length"]),
+                    device=device,
+                )
         else:
             north, _ = attach_top_context(north, assays, assay_embeddings, k=ckpt["model_config"]["top_k"])
         domains.append(("north_known", north))
