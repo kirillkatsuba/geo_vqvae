@@ -85,6 +85,7 @@ def load_low_model(path: Path, device: torch.device) -> tuple[LowVQVAE2, dict]:
         codebook_size=cfg["codebook_size"],
         dropout=cfg["dropout"],
         max_sequence_length=cfg["sequence_length"],
+        decoder_heads=cfg.get("decoder_heads", "single"),
     ).to(device)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()

@@ -11,6 +11,11 @@ from sklearn.neighbors import NearestNeighbors
 from .models import TopVQTransformer
 from .models import TopPriorTransformer
 
+try:
+    from tqdm.auto import tqdm
+except ImportError:  # pragma: no cover
+    tqdm = None
+
 
 def load_top_model(checkpoint_path: Path, device: torch.device) -> tuple[TopVQTransformer, list[str]]:
     try:
@@ -116,6 +121,7 @@ def attach_prior_top_context(
     sequence_length: int,
     device: torch.device,
     prefix: str = "top",
+    show_progress: bool = True,
 ) -> tuple[pd.DataFrame, list[str]]:
     from .dataset import chunk_indices, order_by_xyz
 
@@ -123,7 +129,10 @@ def attach_prior_top_context(
     sequences = chunk_indices(order, sequence_length)
     context = np.full((len(blocks), top_model.d_model), np.nan, dtype=np.float32)
     code_values = np.full(len(blocks), -1, dtype=np.int64)
-    for seq in sequences:
+    iterator = sequences
+    if tqdm is not None and show_progress:
+        iterator = tqdm(sequences, desc="top-prior context", leave=False)
+    for seq in iterator:
         block = torch.tensor(
             blocks.iloc[seq][block_feature_columns].to_numpy(dtype=np.float32),
             device=device,
@@ -152,6 +161,7 @@ def attach_prior_top_context_warm_start(
     warm_start_length: int,
     device: torch.device,
     prefix: str = "top",
+    show_progress: bool = True,
 ) -> tuple[pd.DataFrame, list[str]]:
     from .dataset import order_by_xyz
 
@@ -171,6 +181,7 @@ def attach_prior_top_context_warm_start(
             sequence_length=sequence_length,
             device=device,
             prefix=prefix,
+            show_progress=show_progress,
         )
 
     context_tail = context_order[-warm_start_length:]
@@ -181,6 +192,8 @@ def attach_prior_top_context_warm_start(
     code_values = np.full(len(blocks), -1, dtype=np.int64)
 
     cursor = 0
+    total = int(np.ceil(len(order) / max(1, sequence_length - min(warm_start_length, sequence_length - 1))))
+    progress = tqdm(total=total, desc="top-prior warm context", leave=False) if tqdm is not None and show_progress else None
     while cursor < len(order):
         prefix_len = min(len(history_codes), warm_start_length, sequence_length - 1)
         current_len = min(sequence_length - prefix_len, len(order) - cursor)
@@ -205,6 +218,10 @@ def attach_prior_top_context_warm_start(
         ).tail(warm_start_length)
         history_codes = np.concatenate([history_codes, code_values[seq]])[-warm_start_length:]
         cursor += current_len
+        if progress is not None:
+            progress.update(1)
+    if progress is not None:
+        progress.close()
 
     columns = [f"{prefix}_{idx}" for idx in range(context.shape[1])]
     context_df = pd.DataFrame(context, columns=columns, index=blocks.index)

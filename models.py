@@ -82,6 +82,7 @@ class LowVQVAE2(nn.Module):
         codebook_size: int = 256,
         dropout: float = 0.1,
         max_sequence_length: int = 2048,
+        decoder_heads: str = "single",
     ):
         super().__init__()
         self.block_dim = block_dim
@@ -89,6 +90,7 @@ class LowVQVAE2(nn.Module):
         self.top_dim = top_dim
         self.d_model = d_model
         self.max_sequence_length = max_sequence_length
+        self.decoder_heads = decoder_heads
 
         cond_dim = block_dim + top_dim
         self.cond_proj = nn.Linear(cond_dim, d_model)
@@ -98,13 +100,29 @@ class LowVQVAE2(nn.Module):
             nn.Linear(d_model, d_model),
         )
         self.quantizer = VectorQuantizer(codebook_size=codebook_size, embedding_dim=d_model)
-        self.decoder = nn.Sequential(
-            nn.Linear(cond_dim + d_model, d_model),
-            nn.GELU(),
-            nn.Linear(d_model, d_model),
-            nn.GELU(),
-            nn.Linear(d_model, target_dim),
-        )
+        decoder_input_dim = cond_dim + d_model
+        if decoder_heads == "single":
+            self.decoder = nn.Sequential(
+                nn.Linear(decoder_input_dim, d_model),
+                nn.GELU(),
+                nn.Linear(d_model, d_model),
+                nn.GELU(),
+                nn.Linear(d_model, target_dim),
+            )
+        elif decoder_heads == "grouped":
+            if target_dim != 5:
+                raise ValueError("grouped decoder_heads expects target_dim=5 ordered as AS,S,CORG-1,CA,FE")
+            self.decoder_shared = nn.Sequential(
+                nn.Linear(decoder_input_dim, d_model),
+                nn.GELU(),
+                nn.Linear(d_model, d_model),
+                nn.GELU(),
+            )
+            self.head_geochem_fast = nn.Linear(d_model, 2)
+            self.head_carbon_sulfur = nn.Linear(d_model, 2)
+            self.head_ca = nn.Linear(d_model, 1)
+        else:
+            raise ValueError(f"Unknown decoder_heads: {decoder_heads}")
 
         self.pos = nn.Embedding(max_sequence_length, d_model)
         prior_layer = nn.TransformerEncoderLayer(
@@ -135,7 +153,21 @@ class LowVQVAE2(nn.Module):
         z_q: torch.Tensor,
     ) -> torch.Tensor:
         cond = torch.cat([block_features, top_context], dim=-1)
-        return self.decoder(torch.cat([cond, z_q], dim=-1))
+        decoder_input = torch.cat([cond, z_q], dim=-1)
+        if self.decoder_heads == "single":
+            return self.decoder(decoder_input)
+
+        hidden = self.decoder_shared(decoder_input)
+        geochem_fast = self.head_geochem_fast(hidden)
+        carbon_sulfur = self.head_carbon_sulfur(hidden)
+        ca = self.head_ca(hidden)
+        pred = hidden.new_empty(*hidden.shape[:-1], self.target_dim)
+        pred[..., 0] = geochem_fast[..., 0]  # AS
+        pred[..., 4] = geochem_fast[..., 1]  # FE
+        pred[..., 1] = carbon_sulfur[..., 0]  # S
+        pred[..., 2] = carbon_sulfur[..., 1]  # CORG-1
+        pred[..., 3] = ca[..., 0]  # CA
+        return pred
 
     def prior_logits(
         self,
@@ -175,13 +207,12 @@ class LowVQVAE2(nn.Module):
             "logits": logits,
         }
 
-    @torch.no_grad()
-    def generate(
+    def predict_from_prior(
         self,
         block_features: torch.Tensor,
         top_context: torch.Tensor,
         mask: torch.Tensor | None = None,
-        decode_mode: str = "hard",
+        decode_mode: str = "soft",
         temperature: float = 1.0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         logits = self.prior_logits(block_features, top_context, mask=mask)
@@ -197,6 +228,17 @@ class LowVQVAE2(nn.Module):
         pred = self.decode(block_features, top_context, z_q)
         return pred, codes
 
+    @torch.no_grad()
+    def generate(
+        self,
+        block_features: torch.Tensor,
+        top_context: torch.Tensor,
+        mask: torch.Tensor | None = None,
+        decode_mode: str = "hard",
+        temperature: float = 1.0,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.predict_from_prior(block_features, top_context, mask, decode_mode, temperature)
+
 
 def masked_mse(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
     loss = (pred - target).pow(2)
@@ -204,6 +246,19 @@ def masked_mse(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor | No
         return loss.mean()
     loss = loss * mask.unsqueeze(-1).to(loss.dtype)
     return loss.sum() / (mask.sum().clamp_min(1).to(loss.dtype) * target.size(-1))
+
+
+def weighted_masked_mse(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    weights: torch.Tensor,
+    mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    loss = (pred - target).pow(2) * weights.to(device=pred.device, dtype=pred.dtype).view(1, 1, -1)
+    if mask is None:
+        return loss.mean()
+    loss = loss * mask.unsqueeze(-1).to(loss.dtype)
+    return loss.sum() / (mask.sum().clamp_min(1).to(loss.dtype) * weights.sum().clamp_min(1e-6).to(loss.dtype))
 
 
 def code_ce_loss(logits: torch.Tensor, codes: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:

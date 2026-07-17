@@ -11,7 +11,14 @@ import torch
 from torch.utils.data import DataLoader
 
 from .dataset import LowSequenceDataset, chunk_indices, collate_padded, order_by_xyz
-from .models import LowVQVAE2, code_ce_loss, correlation_loss, masked_mse, reference_correlation_loss
+from .models import (
+    LowVQVAE2,
+    code_ce_loss,
+    correlation_loss,
+    masked_mse,
+    reference_correlation_loss,
+    weighted_masked_mse,
+)
 from .preprocessing import TargetScaler
 from .top_context import (
     attach_prior_top_context,
@@ -36,6 +43,7 @@ class LowConfig:
     dropout: float = 0.1
     sequence_length: int = 1024
     top_k: int = 8
+    decoder_heads: str = "single"
 
 
 def parse_args() -> argparse.Namespace:
@@ -58,9 +66,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-layers", type=int, default=6)
     parser.add_argument("--codebook-size", type=int, default=256)
     parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--decoder-heads", choices=["single", "grouped"], default="single")
     parser.add_argument("--top-k", type=int, default=8)
     parser.add_argument("--lambda-vq", type=float, default=1.0)
     parser.add_argument("--lambda-code", type=float, default=0.2)
+    parser.add_argument("--lambda-soft-recon", type=float, default=0.0)
+    parser.add_argument("--train-softmax-temperature", type=float, default=2.0)
+    parser.add_argument(
+        "--target-weights",
+        type=str,
+        default="",
+        help="Comma-separated target weights. Either 'AS=1,S=2,CORG-1=2,CA=1.2,FE=0.8' or '1,2,2,1.2,0.8'.",
+    )
     parser.add_argument("--lambda-corr", type=float, default=0.1)
     parser.add_argument(
         "--corr-mode",
@@ -79,6 +96,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--corr-block-weight", type=float, default=1.0)
     parser.add_argument("--corr-assay-weight", type=float, default=1.0)
+    parser.add_argument("--corr-on", choices=["hard", "soft"], default="hard")
     parser.add_argument("--decode-mode", choices=["hard", "soft"], default="hard")
     parser.add_argument("--softmax-temperature", type=float, default=1.0)
     parser.add_argument("--max-sequences", type=int, default=0)
@@ -99,6 +117,25 @@ def choose_device(name: str) -> torch.device:
     if torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
+
+
+def parse_target_weights(spec: str, target_columns: list[str], device: torch.device) -> torch.Tensor:
+    raw_names = [col.removeprefix("scaled_").removesuffix("_scaled") for col in target_columns]
+    if not spec:
+        return torch.ones(len(target_columns), device=device)
+    if "=" not in spec:
+        values = [float(item.strip()) for item in spec.split(",") if item.strip()]
+        if len(values) != len(target_columns):
+            raise ValueError(f"Expected {len(target_columns)} target weights, got {len(values)}")
+        return torch.tensor(values, dtype=torch.float32, device=device)
+    mapping = {}
+    for item in spec.split(","):
+        if not item.strip():
+            continue
+        key, value = item.split("=", 1)
+        mapping[key.strip()] = float(value)
+    values = [mapping.get(name, 1.0) for name in raw_names]
+    return torch.tensor(values, dtype=torch.float32, device=device)
 
 
 def numpy_correlation_matrix(values: pd.DataFrame) -> np.ndarray:
@@ -181,6 +218,7 @@ def evaluate(
     corr_assay_weight: float,
     decode_mode: str,
     softmax_temperature: float,
+    target_weights: torch.Tensor,
 ) -> dict[str, float]:
     model.eval()
     losses = []
@@ -199,7 +237,7 @@ def evaluate(
                 decode_mode=decode_mode,
                 temperature=softmax_temperature,
             )
-            recon = masked_mse(pred, targets, mask)
+            recon = weighted_masked_mse(pred, targets, target_weights, mask)
             corr = correlation_regularization(
                 pred,
                 targets,
@@ -258,6 +296,7 @@ def main() -> None:
     val_df = center_ctx.loc[center_ctx["split"] == "val"].reset_index(drop=True)
     block_columns = metadata["block_feature_columns"]
     target_columns = metadata["scaled_target_columns"]
+    target_weights = parse_target_weights(args.target_weights, target_columns, device)
 
     train_sequences = chunk_indices(order_by_xyz(train_df), args.sequence_length)
     val_sequences = chunk_indices(order_by_xyz(val_df), args.sequence_length)
@@ -278,6 +317,7 @@ def main() -> None:
         dropout=args.dropout,
         sequence_length=args.sequence_length,
         top_k=args.top_k,
+        decoder_heads=args.decoder_heads,
     )
     model = LowVQVAE2(
         block_dim=len(block_columns),
@@ -289,6 +329,7 @@ def main() -> None:
         codebook_size=config.codebook_size,
         dropout=config.dropout,
         max_sequence_length=config.sequence_length,
+        decoder_heads=config.decoder_heads,
     ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=1e-4)
 
@@ -312,10 +353,22 @@ def main() -> None:
             mask = batch["mask"].to(device)
             optimizer.zero_grad(set_to_none=True)
             out = model(block, top, targets, mask=mask)
-            recon = masked_mse(out["recon"], targets, mask)
+            recon = weighted_masked_mse(out["recon"], targets, target_weights, mask)
+            soft_recon = out["recon"].new_tensor(0.0)
+            soft_pred = None
+            if args.lambda_soft_recon > 0:
+                soft_pred, _ = model.predict_from_prior(
+                    block,
+                    top,
+                    mask=mask,
+                    decode_mode="soft",
+                    temperature=args.train_softmax_temperature,
+                )
+                soft_recon = weighted_masked_mse(soft_pred, targets, target_weights, mask)
             ce = code_ce_loss(out["logits"], out["codes"].detach(), mask)
+            corr_pred = soft_pred if args.corr_on == "soft" and soft_pred is not None else out["recon"]
             corr = correlation_regularization(
-                out["recon"],
+                corr_pred,
                 targets,
                 mask,
                 args.corr_mode,
@@ -323,7 +376,13 @@ def main() -> None:
                 args.corr_block_weight,
                 args.corr_assay_weight,
             )
-            loss = recon + args.lambda_vq * out["vq_loss"] + args.lambda_code * ce + args.lambda_corr * corr
+            loss = (
+                recon
+                + args.lambda_soft_recon * soft_recon
+                + args.lambda_vq * out["vq_loss"]
+                + args.lambda_code * ce
+                + args.lambda_corr * corr
+            )
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
@@ -342,6 +401,7 @@ def main() -> None:
             args.corr_assay_weight,
             args.decode_mode,
             args.softmax_temperature,
+            target_weights,
         )
         row = {
             "epoch": epoch,
@@ -369,8 +429,12 @@ def main() -> None:
                         "corr_reference_split": args.corr_reference_split,
                         "corr_block_weight": args.corr_block_weight,
                         "corr_assay_weight": args.corr_assay_weight,
+                        "corr_on": args.corr_on,
                         "decode_mode": args.decode_mode,
                         "softmax_temperature": args.softmax_temperature,
+                        "lambda_soft_recon": args.lambda_soft_recon,
+                        "train_softmax_temperature": args.train_softmax_temperature,
+                        "target_weights": [float(value) for value in target_weights.detach().cpu().tolist()],
                     },
                     "block_feature_columns": block_columns,
                     "target_columns": target_columns,

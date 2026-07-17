@@ -47,6 +47,7 @@ def attach_context(
     device: torch.device,
     warm_start_center: bool,
     warm_start_blocks: int,
+    show_progress: bool,
 ) -> pd.DataFrame:
     assays = pd.read_parquet(prepared_dir / "assays.parquet")
     top_model, top_features = load_top_model(Path(ckpt["top_checkpoint"]), device)
@@ -68,6 +69,7 @@ def attach_context(
                 sequence_length=int(top_prior_ckpt["model_config"]["sequence_length"]),
                 warm_start_length=warm_start_blocks,
                 device=device,
+                show_progress=show_progress,
             )
             return blocks_with_context
         blocks_with_context, _ = attach_prior_top_context(
@@ -77,6 +79,7 @@ def attach_context(
             block_feature_columns=ckpt["block_feature_columns"],
             sequence_length=int(top_prior_ckpt["model_config"]["sequence_length"]),
             device=device,
+            show_progress=show_progress,
         )
         return blocks_with_context
 
@@ -99,6 +102,12 @@ def main() -> None:
     target_scaler = TargetScaler.load(args.prepared_dir / "target_scaler.json")
 
     north = pd.read_parquet(args.prepared_dir / "north_blocks.parquet").reset_index(drop=True)
+    print(
+        "Building top context: "
+        f"rows={len(north)}, warm_start_center={not args.no_warm_start_center}, "
+        f"warm_start_blocks={args.warm_start_blocks}",
+        flush=True,
+    )
     north = attach_context(
         north,
         ckpt,
@@ -106,6 +115,7 @@ def main() -> None:
         device,
         warm_start_center=not args.no_warm_start_center,
         warm_start_blocks=args.warm_start_blocks,
+        show_progress=not args.no_progress,
     )
 
     sequence_length = args.sequence_length or int(ckpt["model_config"]["sequence_length"])
@@ -113,7 +123,8 @@ def main() -> None:
         "Predicting north blocks: "
         f"rows={len(north)}, sequence_length={sequence_length}, "
         f"decode_mode={args.decode_mode}, temperature={args.softmax_temperature}, "
-        f"warm_start_center={not args.no_warm_start_center}, warm_start_blocks={args.warm_start_blocks}"
+        f"warm_start_center={not args.no_warm_start_center}, warm_start_blocks={args.warm_start_blocks}",
+        flush=True,
     )
     pred = predict_domain(
         "north_all",
@@ -133,6 +144,7 @@ def main() -> None:
     for target in TARGET_COLUMNS:
         output[target] = pred[f"pred_{target}"].to_numpy()
     output = output[["X", "Y", "Z", "AS", "S", "CORG-1", "FE", "CA"]]
+    print(f"Writing CSV: {args.output_csv}", flush=True)
     output.to_csv(args.output_csv, index=False)
     print(f"Saved predictions: {args.output_csv}")
     print(f"Rows: {len(output)}")

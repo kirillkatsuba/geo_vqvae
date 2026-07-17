@@ -42,6 +42,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-layers", type=int, default=4)
     parser.add_argument("--codebook-size", type=int, default=256)
     parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--feature-dropout", type=float, default=0.0)
+    parser.add_argument("--input-noise-std", type=float, default=0.0)
     parser.add_argument("--lambda-vq", type=float, default=1.0)
     parser.add_argument("--max-sequences", type=int, default=0)
     parser.add_argument("--device", choices=["auto", "cpu", "mps", "cuda"], default="auto")
@@ -112,8 +114,14 @@ def main() -> None:
         for batch in batch_iter:
             features = batch["features"].to(device)
             mask = batch["mask"].to(device)
+            model_input = features
+            if args.feature_dropout > 0:
+                keep = torch.rand_like(model_input) > args.feature_dropout
+                model_input = model_input * keep.to(model_input.dtype)
+            if args.input_noise_std > 0:
+                model_input = model_input + args.input_noise_std * torch.randn_like(model_input)
             optimizer.zero_grad(set_to_none=True)
-            out = model(features, mask=mask)
+            out = model(model_input, mask=mask)
             recon = masked_mse(out["recon"], features, mask)
             loss = recon + args.lambda_vq * out["vq_loss"]
             loss.backward()
