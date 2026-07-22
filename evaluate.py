@@ -17,6 +17,7 @@ import pandas as pd
 import torch
 from torch.utils.data import DataLoader
 
+from .correlation_adjustment import apply_correlation_adjustment_to_frame, build_correlation_reference
 from .dataset import LowSequenceDataset, chunk_indices, collate_padded, order_by_xyz
 from .models import LowVQVAE2
 from .preprocessing import TargetScaler
@@ -47,6 +48,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-plot-points", type=int, default=60000)
     parser.add_argument("--decode-mode", choices=["hard", "soft"], default="hard")
     parser.add_argument("--softmax-temperature", type=float, default=1.0)
+    parser.add_argument(
+        "--corr-adjust",
+        choices=["none", "assay", "block", "blend"],
+        default="none",
+        help="Inference-time correlation matching. This is not a training regularizer.",
+    )
+    parser.add_argument("--corr-adjust-strength", type=float, default=1.0)
+    parser.add_argument(
+        "--corr-adjust-block-split",
+        choices=["train", "train_val", "center_all", "north_known"],
+        default="train",
+    )
+    parser.add_argument("--corr-adjust-block-weight", type=float, default=1.0)
+    parser.add_argument("--corr-adjust-assay-weight", type=float, default=1.0)
+    parser.add_argument("--keep-unadjusted-predictions", action="store_true")
     parser.add_argument("--warm-start-center", action="store_true")
     parser.add_argument("--warm-start-blocks", type=int, default=128)
     parser.add_argument("--device", choices=["auto", "cpu", "mps", "cuda"], default="auto")
@@ -195,6 +211,9 @@ def predict_domain(
     show_progress: bool,
     decode_mode: str = "hard",
     softmax_temperature: float = 1.0,
+    correlation_reference=None,
+    correlation_adjust_strength: float = 1.0,
+    keep_unadjusted_predictions: bool = False,
 ) -> pd.DataFrame:
     block_columns = ckpt["block_feature_columns"]
     target_columns = ckpt["target_columns"]
@@ -231,6 +250,14 @@ def predict_domain(
         out[f"true_{target}"] = blocks.loc[valid_rows, target].to_numpy(dtype=float)
         out[f"pred_{target}"] = pred_raw[target].to_numpy(dtype=float)
         out[f"error_{target}"] = out[f"pred_{target}"] - out[f"true_{target}"]
+    if correlation_reference is not None:
+        out = apply_correlation_adjustment_to_frame(
+            out,
+            target_scaler.columns,
+            correlation_reference,
+            strength=correlation_adjust_strength,
+            keep_unadjusted=keep_unadjusted_predictions,
+        )
     return out
 
 
@@ -243,6 +270,19 @@ def main() -> None:
     metadata = json.loads((args.prepared_dir / "metadata.json").read_text())
     target_scaler = TargetScaler.load(args.prepared_dir / "target_scaler.json")
     assays = pd.read_parquet(args.prepared_dir / "assays.parquet")
+    correlation_reference = build_correlation_reference(
+        prepared_dir=args.prepared_dir,
+        columns=target_scaler.columns,
+        mode=args.corr_adjust,
+        block_split=args.corr_adjust_block_split,
+        block_weight=args.corr_adjust_block_weight,
+        assay_weight=args.corr_adjust_assay_weight,
+    )
+    if correlation_reference is not None:
+        print(
+            "Correlation adjustment: "
+            f"reference={correlation_reference.name}, strength={args.corr_adjust_strength}"
+        )
 
     top_model, top_features = load_top_model(Path(ckpt["top_checkpoint"]), device)
     top_prior_path = ckpt.get("top_prior_checkpoint", "")
@@ -318,6 +358,9 @@ def main() -> None:
             not args.no_progress,
             args.decode_mode,
             args.softmax_temperature,
+            correlation_reference,
+            args.corr_adjust_strength,
+            args.keep_unadjusted_predictions,
         )
         domain_dir = args.output_dir / name
         domain_dir.mkdir(parents=True, exist_ok=True)

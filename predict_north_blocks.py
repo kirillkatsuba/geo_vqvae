@@ -7,6 +7,7 @@ import pandas as pd
 import torch
 
 from .columns import TARGET_COLUMNS
+from .correlation_adjustment import build_correlation_reference
 from .evaluate import choose_device, load_low_model, predict_domain
 from .preprocessing import TargetScaler
 from .top_context import (
@@ -29,6 +30,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--decode-mode", choices=["hard", "soft"], default="soft")
     parser.add_argument("--softmax-temperature", type=float, default=4.0)
+    parser.add_argument(
+        "--corr-adjust",
+        choices=["none", "assay", "block", "blend"],
+        default="none",
+        help="Inference-time correlation matching. This is not a training regularizer.",
+    )
+    parser.add_argument("--corr-adjust-strength", type=float, default=1.0)
+    parser.add_argument(
+        "--corr-adjust-block-split",
+        choices=["train", "train_val", "center_all", "north_known"],
+        default="train",
+    )
+    parser.add_argument("--corr-adjust-block-weight", type=float, default=1.0)
+    parser.add_argument("--corr-adjust-assay-weight", type=float, default=1.0)
+    parser.add_argument("--keep-unadjusted-predictions", action="store_true")
     parser.add_argument("--warm-start-blocks", type=int, default=128)
     parser.add_argument(
         "--no-warm-start-center",
@@ -100,6 +116,20 @@ def main() -> None:
     device = choose_device(args.device)
     model, ckpt = load_low_model(args.low_checkpoint, device)
     target_scaler = TargetScaler.load(args.prepared_dir / "target_scaler.json")
+    correlation_reference = build_correlation_reference(
+        prepared_dir=args.prepared_dir,
+        columns=target_scaler.columns,
+        mode=args.corr_adjust,
+        block_split=args.corr_adjust_block_split,
+        block_weight=args.corr_adjust_block_weight,
+        assay_weight=args.corr_adjust_assay_weight,
+    )
+    if correlation_reference is not None:
+        print(
+            "Correlation adjustment: "
+            f"reference={correlation_reference.name}, strength={args.corr_adjust_strength}",
+            flush=True,
+        )
 
     north = pd.read_parquet(args.prepared_dir / "north_blocks.parquet").reset_index(drop=True)
     print(
@@ -138,6 +168,9 @@ def main() -> None:
         not args.no_progress,
         args.decode_mode,
         args.softmax_temperature,
+        correlation_reference,
+        args.corr_adjust_strength,
+        args.keep_unadjusted_predictions,
     )
 
     output = pred[["X", "Y", "Z"]].copy()

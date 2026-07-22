@@ -179,6 +179,60 @@ Outputs per domain:
 - `predictions.csv`
 - `metrics.csv`
 
+### Inference-time correlation matching
+
+This is an alternative to correlation regularization: the model checkpoint is
+not retrained. After prediction, the vector `AS/S/CORG-1/CA/FE` is linearly
+recolored so that its cross-target correlation matrix is closer to a reference
+matrix from assays, center block model, or their blend.
+
+Recommended first check for the current `v7_soft_t4` setup:
+
+```bash
+python3 -m geo_vqvae.evaluate \
+  --prepared-dir geo_vqvae/prepared_v2 \
+  --low-checkpoint geo_vqvae/runs/low_v7_soft_val/best_low.pt \
+  --output-dir geo_vqvae/eval/low_v7_soft_val_t4_corr_assay_s05 \
+  --domain both \
+  --sequence-length 512 \
+  --batch-size 64 \
+  --decode-mode soft \
+  --softmax-temperature 4.0 \
+  --corr-adjust assay \
+  --corr-adjust-strength 0.5 \
+  --keep-unadjusted-predictions \
+  --device cuda
+```
+
+Useful variants:
+
+```bash
+# Match training assay correlations more strongly.
+--corr-adjust assay --corr-adjust-strength 1.0
+
+# Match center block-model correlations.
+--corr-adjust block --corr-adjust-block-split train --corr-adjust-strength 0.5
+
+# Blend assay and center block-model references.
+--corr-adjust blend --corr-adjust-assay-weight 2.0 --corr-adjust-block-weight 1.0 --corr-adjust-strength 0.5
+```
+
+Generate the full north block model with the same post-calibration:
+
+```bash
+python3 -m geo_vqvae.predict_north_blocks \
+  --prepared-dir geo_vqvae/prepared_v2 \
+  --low-checkpoint geo_vqvae/runs/low_v7_soft_val/best_low.pt \
+  --output-csv geo_vqvae/predictions/north_blocks_low_v7_soft_t4_corr_assay_s05.csv \
+  --sequence-length 512 \
+  --batch-size 64 \
+  --decode-mode soft \
+  --softmax-temperature 4.0 \
+  --corr-adjust assay \
+  --corr-adjust-strength 0.5 \
+  --device cuda
+```
+
 ## Smoke commands
 
 ```bash
